@@ -1,5 +1,5 @@
 
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   AlertTriangle,
   Bell,
@@ -36,7 +36,7 @@ import {
 } from 'recharts'
 import { CATEGORY_DATA, DEFAULT_DEPARTMENTS } from './data/seedData.js'
 import { api, normalizeComplaint } from './services/apiClient.js'
-import { buildIssueGroups, buildReportSnapshot, buildWeeklyTrend, computeAnalytics, normalizeStudentKey } from './utils/analytics.js'
+import { buildIssueGroups, computeAnalytics, normalizeStudentKey } from './utils/analytics.js'
 
 const ADMIN_ROLES = ['superAdmin', 'managementViewer', 'departmentAdmin', 'safeguardingOfficer']
 const CHART_COLORS = ['#1d4ed8', '#0f766e', '#f59e0b', '#ec4899', '#8b5cf6', '#10b981', '#ef4444', '#e2e8f0']
@@ -64,6 +64,12 @@ function hasAdminAccess(role) {
   return ADMIN_ROLES.includes(role)
 }
 
+function getReportRequest(periodType, range) {
+  if (periodType !== 'custom') return { periodType }
+  if (!range.startDate || !range.endDate) return null
+  return { periodType, startAt: range.startDate, endAt: range.endDate }
+}
+
 function cardClass(color = 'blue') {
   const map = {
     blue: 'navy-card',
@@ -76,10 +82,11 @@ function cardClass(color = 'blue') {
 }
 
 function App() {
-  const [data, setData] = useState({ users: [], complaints: [], notifications: [], departments: DEFAULT_DEPARTMENTS, issueGroups: [] })
+  const [data, setData] = useState({ users: [], complaints: [], notifications: [], departments: DEFAULT_DEPARTMENTS, issueGroups: [], analytics: null })
   const [view, setView] = useState('landing')
   const [portal, setPortal] = useState('student')
   const [currentUser, setCurrentUser] = useState(null)
+  const [dataConnected, setDataConnected] = useState(false)
   const [authMode, setAuthMode] = useState('login')
   const [authForm, setAuthForm] = useState({ name: '', email: '', password: '', studentId: '', department: '' })
   const [error, setError] = useState('')
@@ -87,6 +94,7 @@ function App() {
   const [selectedComplaintId, setSelectedComplaintId] = useState('')
   const [reportRange, setReportRange] = useState('month')
   const [customRange, setCustomRange] = useState({ startDate: '', endDate: '' })
+  const [generatedReport, setGeneratedReport] = useState(null)
   const [searchTerm, setSearchTerm] = useState('')
   const [statusFilter, setStatusFilter] = useState('All')
   const [complaintForm, setComplaintForm] = useState({
@@ -97,12 +105,13 @@ function App() {
     isAnonymous: false,
   })
 
-  const loadUserData = async () => {
+  const loadUserData = useCallback(async (role) => {
     try {
-      const [complaintsResult, notificationsResult, groupsResult] = await Promise.all([
+      const [complaintsResult, notificationsResult, groupsResult, analyticsResult] = await Promise.all([
         api.complaints(),
         api.notifications(),
-        api.issueGroups(),
+        hasAdminAccess(role) ? api.issueGroups() : Promise.resolve({ groups: [] }),
+        hasAdminAccess(role) ? api.analytics() : Promise.resolve({ analytics: null }),
       ])
       setData((previous) => ({
         ...previous,
@@ -115,30 +124,39 @@ function App() {
           createdAt: item.created_at,
           read: Boolean(item.read_at),
         })),
+        analytics: analyticsResult.analytics,
         issueGroups: (groupsResult.groups || []).map((group) => ({
           id: group.id,
           title: group.title,
           explanation: group.summary || 'Database-backed recurring issue.',
-          priority: 'MEDIUM',
-          urgency: 'NORMAL',
+          priority: group.priority || 'MEDIUM',
+          urgency: group.urgency || 'NORMAL',
           distinctStudents: group.distinct_students || 0,
           count: group.member_count || group.complaint_count || 0,
           department: group.department || 'General Administration',
           groupingMethod: 'embedding',
           firstReported: group.first_reported,
           latestReported: group.latest_reported,
-          complaints: [],
+          complaints: (group.complaints || []).map((complaint) => ({
+            ...complaint,
+            safetyFlags: complaint.safety_flags || complaint.safetyFlags || [],
+          })),
         })),
       }))
+      setDataConnected(true)
     } catch (loadError) {
+      setDataConnected(false)
       setError(loadError.message)
     }
-  }
+  }, [])
 
   useEffect(() => {
     let active = true
     const refresh = async () => {
       try {
+        const health = await api.health()
+        if (!active) return
+        setDataConnected(health.database === 'connected')
         const session = await api.session()
         if (!active) return
         if (!session.user) {
@@ -149,32 +167,51 @@ function App() {
         setCurrentUser(session.user)
         setPortal(session.user.role === 'student' ? 'student' : 'admin')
         setView(session.user.role === 'student' ? 'studentPortal' : 'adminPortal')
-        await loadUserData()
+        await loadUserData(session.user.role)
       } catch (sessionError) {
-        if (active) setError(sessionError.message)
+        if (active) {
+          setDataConnected(false)
+          setError(sessionError.message)
+        }
       }
     }
     refresh()
     return () => { active = false }
-  }, [])
+  }, [loadUserData])
 
   useEffect(() => {
     if (!currentUser) return undefined
     const interval = window.setInterval(() => {
-      loadUserData()
+      loadUserData(currentUser.role)
     }, 15000)
     return () => window.clearInterval(interval)
-  }, [currentUser])
+  }, [currentUser, loadUserData])
 
   const issueGroups = useMemo(
     () => data.issueGroups?.length ? data.issueGroups : buildIssueGroups(data.complaints),
     [data.complaints, data.issueGroups],
   )
-  const analytics = useMemo(() => computeAnalytics(data.complaints), [data.complaints])
-  const reportData = useMemo(
-    () => buildReportSnapshot(data.complaints, reportRange, customRange),
-    [data.complaints, reportRange, customRange],
-  )
+  const analytics = useMemo(() => data.analytics || computeAnalytics(data.complaints), [data.analytics, data.complaints])
+  const reportRequest = getReportRequest(reportRange, customRange)
+  const reportRequestKey = JSON.stringify(reportRequest)
+  const reportSummary = generatedReport?.requestKey === reportRequestKey ? generatedReport.report : null
+
+  useEffect(() => {
+    if (!currentUser || !hasAdminAccess(currentUser.role) || studentPage !== 'reports') {
+      return undefined
+    }
+    const request = getReportRequest(reportRange, customRange)
+    if (!request) return undefined
+    let active = true
+    api.createReport(request)
+      .then(({ report }) => {
+        if (active) setGeneratedReport({ requestKey: JSON.stringify(request), report })
+      })
+      .catch((reportError) => {
+        if (active) setError(`Could not load report data: ${reportError.message}`)
+      })
+    return () => { active = false }
+  }, [currentUser, studentPage, reportRange, customRange])
 
   const filteredComplaints = useMemo(() => (
     data.complaints.filter((complaint) => {
@@ -225,10 +262,15 @@ function App() {
           studentId: authForm.studentId,
           department: authForm.department || 'General Administration',
         })
+        if (result.confirmationRequired) {
+          setAuthMode('login')
+          setError(result.message || 'Check your email to confirm your account, then sign in.')
+          return
+        }
         setCurrentUser(result.user)
         setView('studentPortal')
         setStudentPage('dashboard')
-        await loadUserData()
+        await loadUserData(result.user.role)
       } else {
         const result = await api.login({ email, password })
         if (portal === 'student' && result.user.role !== 'student') {
@@ -243,7 +285,7 @@ function App() {
         }
         setCurrentUser(result.user)
         setView(portal === 'student' ? 'studentPortal' : 'adminPortal')
-        await loadUserData()
+        await loadUserData(result.user.role)
       }
       setError('')
     } catch (authError) {
@@ -293,7 +335,7 @@ function App() {
   const handleFeedback = async (complaintId, rating) => {
     try {
       await api.feedback(complaintId, { rating, comment: 'Feedback recorded.' })
-      await loadUserData()
+      await loadUserData(currentUser.role)
     } catch (feedbackError) {
       setError(feedbackError.message)
     }
@@ -306,7 +348,7 @@ function App() {
         officialResponse: status === 'Resolved' ? 'The complaint has been resolved after review.' : '',
         note: `Status changed to ${status}.`,
       })
-      await loadUserData()
+      await loadUserData(currentUser.role)
     } catch (updateError) {
       setError(updateError.message)
     }
@@ -339,21 +381,41 @@ function App() {
   }))
 
   const priorityChartData = Object.entries(analytics.byPriority).map(([name, value]) => ({ name, value }))
-  const reportDepartmentChartData = reportData.analytics.deptStats.map((entry) => ({ name: entry.name, value: entry.count }))
-  const weeklyTrendData = buildWeeklyTrend(data.complaints)
+  const reportDepartmentChartData = (reportSummary?.deptStats || []).map((entry) => ({ name: entry.name, value: entry.count }))
+  const weeklyTrendData = data.analytics?.weeklyTrend || []
+  const trendingIssue = [...issueGroups].sort((a, b) => b.count - a.count)[0]
+  const safetyComplaintCount = data.analytics?.safetyRestricted
+    ?? data.complaints.filter((complaint) => complaint.isSafetyRestricted).length
 
-  const exportCsvReport = () => {
+  const fetchCurrentReport = async () => {
+    const request = getReportRequest(reportRange, customRange)
+    if (!request) throw new Error('Choose both dates for the custom report period.')
+    const result = await api.createReport(request)
+    setGeneratedReport({ requestKey: JSON.stringify(request), report: result.report })
+    return result.report
+  }
+
+  const exportCsvReport = async () => {
+    let report
+    try {
+      report = await fetchCurrentReport()
+    } catch (exportError) {
+      setError(`Could not export report: ${exportError.message}`)
+      return
+    }
     const csvRows = [
       ['Metric', 'Value'],
-      ['Period', reportRange],
-      ['Total complaints', String(reportData.total)],
-      ['Unique students', String(reportData.uniqueStudents)],
-      ['Resolution rate', `${Math.round(reportData.analytics.resolutionRate)}%`],
-      ['Critical issues', String(reportData.analytics.byPriority.CRITICAL)],
-      ['High priority', String(reportData.analytics.byPriority.HIGH)],
-      ['Issue groups', String(reportData.issueGroupCount)],
-      ...reportData.analytics.categoryStats.map((entry) => [`Category: ${entry.name}`, String(entry.count)]),
-      ...reportData.analytics.deptStats.map((entry) => [`Department: ${entry.name}`, String(entry.count)]),
+      ['Period', `${report.startAt} to ${report.endAt}`],
+      ['Total complaints', String(report.total)],
+      ['Unique students', String(report.distinctStudents)],
+      ['Resolution rate', `${Math.round(report.resolutionRate)}%`],
+      ['Critical issues', String(report.byPriority.CRITICAL)],
+      ['High priority', String(report.byPriority.HIGH)],
+      ['Issue groups', String(report.issueGroupCount)],
+      ...Object.entries(report.byPriority).map(([priority, count]) => [`Priority: ${priority}`, String(count)]),
+      ...Object.entries(report.byStatus).map(([status, count]) => [`Status: ${status}`, String(count)]),
+      ...report.categoryStats.map((entry) => [`Category: ${entry.name}`, String(entry.count)]),
+      ...report.deptStats.map((entry) => [`Department: ${entry.name}`, String(entry.count)]),
     ]
 
     const csv = csvRows.map((row) => row.map((value) => `"${String(value).replace(/"/g, '""')}"`).join(',')).join('\n')
@@ -365,29 +427,69 @@ function App() {
     URL.revokeObjectURL(link.href)
   }
 
-  const exportPdfReport = () => {
+  const exportPdfReport = async () => {
+    let report
+    try {
+      report = await fetchCurrentReport()
+    } catch (exportError) {
+      setError(`Could not export report: ${exportError.message}`)
+      return
+    }
     const lines = [
       'CampusVoice AI report',
       `Generated: ${new Date().toISOString()}`,
-      `Period: ${reportRange}`,
-      `Total complaints: ${reportData.total}`,
-      `Unique students: ${reportData.uniqueStudents}`,
-      `Resolution rate: ${Math.round(reportData.analytics.resolutionRate)}%`,
-      `Critical issues: ${reportData.analytics.byPriority.CRITICAL}`,
-      `High priority: ${reportData.analytics.byPriority.HIGH}`,
-      `Issue groups: ${reportData.issueGroupCount}`,
-      ...reportData.issueGroups.slice(0, 4).map((group) => `${group.title}: ${group.count} complaints; ${group.distinctStudents} students`),
+      `Period: ${report.startAt} to ${report.endAt}`,
+      `Total complaints: ${report.total}`,
+      `Unique students: ${report.distinctStudents}`,
+      `Resolution rate: ${Math.round(report.resolutionRate)}%`,
+      `Critical issues: ${report.byPriority.CRITICAL}`,
+      `High priority: ${report.byPriority.HIGH}`,
+      `Issue groups: ${report.issueGroupCount}`,
+      ...Object.entries(report.byStatus).map(([status, count]) => `Status ${status}: ${count}`),
+      ...report.categoryStats.map((entry) => `Category ${entry.name}: ${entry.count} complaints`),
+      ...report.deptStats.map((entry) => `Department ${entry.name}: ${entry.count} complaints`),
+      ...(report.aiSummary?.summary ? [`AI summary: ${report.aiSummary.summary}`] : []),
+      ...(report.aiSummary?.recommendations || []).map((item) => `Recommendation: ${item}`),
     ]
 
-    const escapePdfText = (value) => String(value).replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)')
-    const textStream = lines.map((line, index) => `BT /F1 12 Tf 50 ${760 - index * 22} Td (${escapePdfText(line)}) Tj ET`).join('\n')
+    const escapePdfText = (value) => String(value)
+      .replace(/[^\x20-\x7E]/g, '?')
+      .replace(/\\/g, '\\\\')
+      .replace(/\(/g, '\\(')
+      .replace(/\)/g, '\\)')
+    const wrappedLines = lines.flatMap((line) => {
+      const words = escapePdfText(line).split(/\s+/)
+      const result = []
+      let current = ''
+      words.forEach((word) => {
+        if (current && `${current} ${word}`.length > 85) {
+          result.push(current)
+          current = word
+        } else {
+          current = current ? `${current} ${word}` : word
+        }
+      })
+      if (current) result.push(current)
+      return result
+    })
+    const pages = Array.from({ length: Math.ceil(wrappedLines.length / 35) || 1 }, (_, index) => (
+      wrappedLines.slice(index * 35, (index + 1) * 35)
+    ))
+    const pageReferences = pages.map((_, index) => `${4 + index * 2} 0 R`).join(' ')
     const objects = [
       '<< /Type /Catalog /Pages 2 0 R >>',
-      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+      `<< /Type /Pages /Kids [${pageReferences}] /Count ${pages.length} >>`,
       '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
-      `<< /Length ${textStream.length} >>\nstream\n${textStream}\nendstream`,
     ]
+    pages.forEach((pageLines, index) => {
+      const pageNumber = 4 + index * 2
+      const contentNumber = pageNumber + 1
+      const textStream = pageLines
+        .map((line, lineIndex) => `BT /F1 10 Tf 50 ${760 - lineIndex * 20} Td (${line}) Tj ET`)
+        .join('\n')
+      objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentNumber} 0 R >>`)
+      objects.push(`<< /Length ${textStream.length} >>\nstream\n${textStream}\nendstream`)
+    })
 
     let pdf = '%PDF-1.4\n'
     const offsets = [0]
@@ -423,7 +525,7 @@ function App() {
               <div className="brand-subtext">Smart grievance intelligence</div>
             </div>
           </div>
-          <div className="pill-tag">Production data</div>
+          <div className="pill-tag">{dataConnected ? 'Supabase live data' : 'Supabase connection required'}</div>
           <button className="primary-btn small" onClick={() => { setPortal('student'); setView('studentAuth') }}>
             Student Login
           </button>
@@ -463,18 +565,22 @@ function App() {
           <aside className="insight-panel">
             <div className="mini-card navy-card">
               <div className="card-label"><LayoutDashboard size={18} /> Live campus insight</div>
-              <div className="big-number">{analytics.total}</div>
+              <div className="big-number">{dataConnected ? analytics.total : '—'}</div>
               <div className="small-label">complaints tracked</div>
             </div>
             <div className="mini-card success-card">
               <div className="card-label"><TrendingUp size={18} /> Trending issue</div>
-              <div className="mini-title">Hostel food quality</div>
-              <div className="small-label">42 distinct students affected</div>
+              <div className="mini-title">{dataConnected ? trendingIssue?.title || 'No recurring issues yet' : 'Database unavailable'}</div>
+              <div className="small-label">{dataConnected
+                ? trendingIssue ? `${trendingIssue.distinctStudents} distinct students affected` : 'Live issue groups appear here'
+                : 'Connect Supabase to load current issue groups'}</div>
             </div>
             <div className="mini-card warning-card">
               <div className="card-label"><ShieldAlert size={18} /> Safety alert</div>
-              <div className="mini-title">Escalation workflow active</div>
-              <div className="small-label">Requires human review</div>
+              <div className="mini-title">{!dataConnected
+                ? 'Database unavailable'
+                : safetyComplaintCount ? `${safetyComplaintCount} restricted case${safetyComplaintCount === 1 ? '' : 's'}` : 'No active safety cases'}</div>
+              <div className="small-label">{dataConnected ? 'From current Supabase records' : 'Live data unavailable'}</div>
             </div>
           </aside>
         </main>
@@ -1074,11 +1180,27 @@ function App() {
               )}
 
               <div className="stats-grid four-up compact-grid">
-                <div className="stat-card"><div className="stat-label">Complaints</div><div className="stat-value">{reportData.total}</div></div>
-                <div className="stat-card"><div className="stat-label">Unique students</div><div className="stat-value">{reportData.uniqueStudents}</div></div>
-                <div className="stat-card"><div className="stat-label">Resolution rate</div><div className="stat-value">{Math.round(reportData.analytics.resolutionRate)}%</div></div>
-                <div className="stat-card"><div className="stat-label">Group count</div><div className="stat-value">{reportData.issueGroupCount}</div></div>
+                <div className="stat-card"><div className="stat-label">Complaints</div><div className="stat-value">{reportSummary?.total ?? '—'}</div></div>
+                <div className="stat-card"><div className="stat-label">Unique students</div><div className="stat-value">{reportSummary?.distinctStudents ?? '—'}</div></div>
+                <div className="stat-card"><div className="stat-label">Resolution rate</div><div className="stat-value">{reportSummary ? `${Math.round(reportSummary.resolutionRate)}%` : '—'}</div></div>
+                <div className="stat-card"><div className="stat-label">Group count</div><div className="stat-value">{reportSummary?.issueGroupCount ?? '—'}</div></div>
               </div>
+
+              {reportSummary?.aiSummary?.summary ? (
+                <div className="notification-card">
+                  <div className="notification-title">Gemini management summary</div>
+                  <div className="notification-text">{reportSummary.aiSummary.summary}</div>
+                  {reportSummary.aiSummary.recommendations.map((recommendation, index) => (
+                    <div className="notification-text" key={`${index}-${recommendation}`}>{recommendation}</div>
+                  ))}
+                </div>
+              ) : (
+                <div className="notification-text">
+                  {reportSummary?.aiSummaryStatus === 'unavailable'
+                    ? 'Management summary unavailable; aggregate report data is still available.'
+                    : 'Loading report data...'}
+                </div>
+              )}
 
               <div className="chart-grid two-col-charts">
                 <div className="chart-card">

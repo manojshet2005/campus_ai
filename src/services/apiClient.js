@@ -48,6 +48,7 @@ export function normalizeComplaint(row) {
     } : null,
     safetyFlags: row.safety_flags || [],
     isAnonymous: row.is_anonymous || false,
+    isSafetyRestricted: row.is_safety_restricted || false,
     officialResponse: row.official_response || '',
     semanticEmbedding,
     statusHistory: (row.status_history || []).map((entry) => ({
@@ -58,6 +59,7 @@ export function normalizeComplaint(row) {
 }
 
 export const api = {
+  health: () => request('/health'),
   session: () => request('/auth/session'),
   register: (data) => request('/auth/register', { method: 'POST', body: JSON.stringify(data) }),
   login: (data) => request('/auth/login', { method: 'POST', body: JSON.stringify(data) }),

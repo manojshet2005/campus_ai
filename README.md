@@ -1,79 +1,69 @@
-# CAMPUSVOICE AI
+# CampusVoice AI
 
-CampusVoice AI is a Vite/React application with Vercel Serverless API routes, Neon PostgreSQL, Drizzle migrations, session authentication, and server-side Google Gemini integration.
-
-## No Firebase or demo mode
-
-Firebase code and configuration are removed. The application does not contain seeded accounts or records, browser database state, or simulated Gemini analysis. If database or Gemini configuration is missing, API routes return explicit service errors.
+CampusVoice AI keeps its existing React/Vite interface and serves it from Vercel. Vercel serverless API routes use Supabase Auth for identity, Supabase PostgreSQL with `pgvector` for persistent data, and Google Gemini for complaint analysis and semantic embeddings. Firebase and Neon are not used by the current application.
 
 ## Local setup
 
-```powershell
-npm install
-copy .env.example .env.local
-npm run dev
-```
+Use Node.js 20.19+ or 22.12+.
 
-Set `DATABASE_URL` and `DATABASE_URL_UNPOOLED` to Neon pooler/direct connection strings. Set `GEMINI_API_KEY` only in server environment configuration; never use a `VITE_` Gemini variable.
+1. Copy `.env.example` to `.env.local` only if `.env.local` does not already exist. Add credentials locally without checking that file into Git.
+2. Set `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`, `DATABASE_URL`, and `GEMINI_API_KEY`.
+3. Configure Supabase Auth email confirmation to match your desired signup flow. When confirmation is enabled, students must confirm their email and then sign in.
+4. Run `npm run db:migrate` to create/upgrade the Supabase schema and verify the tables, RLS flags, and vector index.
+5. Run `npm run dev` for the Vite UI. Vercel's local dev command is recommended when testing serverless `/api` routes locally.
 
-Run the PostgreSQL schema migration:
+`SUPABASE_SECRET_KEY`, database credentials, `GEMINI_API_KEY`, and `ADMIN_BOOTSTRAP_SECRET` are server-only. Never prefix them with `VITE_`, expose them to the browser, or commit `.env.local`.
 
-```powershell
-npm run db:migrate
-```
+## Supabase database connections
 
-The migration enables `pgvector`, creates the relational schema, constraints, indexes, embeddings, status history, safeguarding, notifications, reports, feedback and audit tables.
+- `DATABASE_URL` is the serverless runtime PostgreSQL connection. Use the Supabase transaction pooler (normally port `6543`) and `sslmode=require`. The Node PostgreSQL client disables prepared statements for pooler compatibility and limits each function to one connection.
+- `DATABASE_URL_MIGRATIONS` is optional and should be a direct or session-pooler connection (normally port `5432`) for schema changes. The migration command falls back to `DATABASE_URL` when it is absent.
+- URL-encode special characters in the database password, especially `@`, `:`, `/`, `?`, `#`, and `%`.
 
-## Authentication
+The migration creates the departments, user profiles, complaints, Gemini analyses and embeddings, issue groups and members, status history, notifications, safeguarding cases, internal notes, management reports/actions, feedback, audit logs, and AI request tables. It enables `pgvector`, creates the cosine-similarity HNSW index, and installs the Auth profile trigger and role-aware RLS policies. The migration is idempotent and keeps its checksum in `app_schema_migrations`.
 
-Public registration always creates a `student` account. Passwords use bcrypt with server-side validation. Sessions are random opaque tokens stored as SHA-256 hashes, expire after seven days, support revocation, and use HTTP-only, Secure (when deployed on HTTPS), SameSite=Lax cookies.
+For an existing Neon deployment, this schema migration does not copy data. Export and import the old database separately after preparing Supabase Auth accounts and mapping each existing profile to an Auth user. Existing `password_hash` columns are not used for login and must not be exposed; existing complaint rows and their foreign keys are retained when the schema is applied to an already-populated database.
 
-Administrator accounts must be provisioned directly in PostgreSQL or through a trusted administrative provisioning process. Public registration cannot assign an administrator role or department.
+## Authentication and authorization
 
-The API verifies the session and role on every request. Department administrators are constrained to their department and cannot access restricted safety complaints. Safeguarding officers can access safety-restricted cases. Management viewers are read-only.
+Student registration and login use Supabase Auth's server API. A database trigger creates each new student's application profile; public metadata cannot set an administrator role. Admin login uses the same Supabase Auth login flow. Provision the first administrator through the protected bootstrap endpoint using a locally generated `ADMIN_BOOTSTRAP_SECRET`, then disable/remove that bootstrap secret after setup.
 
-## Gemini
+The API stores Supabase access/refresh tokens in an `HttpOnly`, `SameSite=Lax` cookie, verifies access tokens with Supabase Auth, refreshes expired sessions, and reads authorization roles from the protected application profile. Admin roles are only assigned by the server bootstrap path. API queries enforce student ownership, administrator role, department scope, and safeguarding restrictions.
 
-The server uses `@google/genai` and `GEMINI_API_KEY`. `GEMINI_MODEL` defaults to `gemini-3.5-flash-lite`; `GEMINI_EMBEDDING_MODEL` defaults to `gemini-embedding-2`.
+RLS is enabled on application data. Policies scope direct Supabase access by `auth.uid()` and the server-owned application role; sensitive safeguarding rows and audit data have narrower policies. The Vercel API connects through the PostgreSQL `postgres` database account, which bypasses RLS, so its server-side authorization checks are required and remain part of the trust boundary. Do not put database credentials or the Supabase secret key in frontend code.
 
-Before deployment, verify that both model names are enabled for the Google AI Studio key and account. Complaint submission requests structured analysis and a 768-dimensional embedding, validates strict Zod JSON, stores the original text unchanged, and writes analysis/embedding/status/notification records transactionally. Missing or invalid Gemini responses cause a visible 502 and no complaint is stored.
+The migration revokes broad table privileges from `anon` and `authenticated`, then grants scoped reads only. All writes go through the server API, which enforces role, department, ownership, and safeguarding rules; the Vercel database connection bypasses RLS, so server-side authorization remains mandatory.
 
-For a local live Gemini check, place the server key in the ignored `.env.local` file and run:
+## Gemini complaint intelligence
 
-```powershell
-npm run test:gemini
-```
+The API calls Google Gemini for validated structured complaint summaries, category, subcategory, priority, urgency, sentiment, safety review flags, explanations, and recommendations. It also creates 768-dimensional embeddings. Similar complaints are grouped by pgvector cosine distance; distinct student counts use unique profile IDs. If Gemini returns invalid data or is unavailable, submission fails explicitly and the complaint is not stored.
 
-This performs real text, complaint-JSON, and embedding requests. It does not create database records.
+Configure `GEMINI_MODEL` and `GEMINI_EMBEDDING_MODEL` only if you need to change the defaults. Run `npm run test:gemini` to make live text-generation, structured-analysis, and embedding requests; the script does not write database records.
 
-## API routes
+## Reports and exports
 
-- `POST /api/auth/register` — student registration
-- `POST /api/auth/login` — login
-- `POST /api/auth/logout` — revoke session
-- `GET /api/auth/session` — current session
-- `GET /api/complaints` — role-scoped complaint retrieval
-- `POST /api/complaints` — Gemini-analyzed student complaint submission
-- `PATCH /api/complaints/:id` — authorised complaint assignment/status/response updates
-- `POST /api/complaints/:id/feedback` — resolved-case student feedback
-- `GET /api/analytics` — role-scoped database analytics
-- `GET /api/notifications` — student notifications
+The management report endpoint calculates totals, distinct student counts, resolution rates, priorities, categories, departments, issue groups, and weekly trends from timestamped PostgreSQL records under the requesting administrator's scope. CSV/PDF downloads use that generated report rather than the browser's limited complaint list. Gemini management summaries are best-effort: if the model is unavailable, the report and exports still work and the UI indicates the summary is unavailable.
+
+## Administrator bootstrap
+
+Create the first administrator using a one-time POST to `/api/admin/bootstrap`. Send `x-admin-bootstrap-secret: <ADMIN_BOOTSTRAP_SECRET>` and a JSON body containing `name`, `email`, a strong `password`, `role`, and, for department administrators, `department`. This endpoint provisions an Auth account and assigns its role in the database. Keep the bootstrap secret private and rotate/remove it after provisioning.
 
 ## Vercel deployment
 
-1. Create a Neon project and copy its pooled and direct connection strings.
-2. Run `npm run db:migrate` locally using `DATABASE_URL_UNPOOLED`.
-3. Import the project into Vercel and set:
-   - `DATABASE_URL` — Neon pooled URL
-   - `DATABASE_URL_UNPOOLED` — direct URL
-   - `GEMINI_API_KEY`
-   - `GEMINI_MODEL=gemini-3.5-flash-lite`
-   - `GEMINI_EMBEDDING_MODEL=gemini-embedding-2`
-   - `APP_URL=https://YOUR-DOMAIN`
-   - `ADMIN_BOOTSTRAP_SECRET`
-4. Set each environment variable in Vercel Preview and Production as appropriate.
-5. Deploy with `vercel --prod` or by connecting the repository.
-6. Run a real registration, login, complaint submission, database read, Gemini model request, and admin status update before accepting the deployment.
+Configure these server environment variables in the Vercel project (Development/Preview/Production as appropriate):
+
+- `SUPABASE_URL`
+- `SUPABASE_PUBLISHABLE_KEY`
+- `SUPABASE_SECRET_KEY` (server only)
+- `DATABASE_URL`
+- `DATABASE_URL_MIGRATIONS` (recommended for migrations; not required at runtime)
+- `GEMINI_API_KEY` (server only)
+- `GEMINI_MODEL` (optional; default `gemini-3.5-flash-lite`)
+- `GEMINI_EMBEDDING_MODEL` (optional; default `gemini-embedding-2`)
+- `APP_URL` (the deployed origin, used for secure cookies and same-origin checks)
+- `ADMIN_BOOTSTRAP_SECRET` (only while provisioning the first admin)
+
+Run the database migration from a trusted local environment with the migration URL. Deploy with Vercel after setting all required variables. `vercel.json` directs the Vite SPA to `index.html`; native Vercel API routes under `api/` are not rewritten back into themselves.
 
 ## Validation
 
@@ -82,6 +72,9 @@ npm test
 npm run lint
 npm run build
 npm run db:migrate
+npm run test:gemini
 ```
 
-No live database or Gemini request is claimed until credentials are supplied and verified.
+Successful unit/build checks do not prove cloud access. Report live Supabase or Gemini success only after the configured service responds and the corresponding operation has been verified.
+
+Credentials previously shared in chat should be rotated in Supabase and Google AI Studio before production use. Enter only the newly rotated values in the ignored local `.env.local` file or Vercel's encrypted environment settings; do not send them in chat or commit them.

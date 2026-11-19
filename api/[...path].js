@@ -1,19 +1,27 @@
-import bcrypt from 'bcryptjs'
 /* global process */
+import { Buffer } from 'node:buffer'
+import bcrypt from 'bcryptjs'
 import { z } from 'zod'
 import { GoogleGenAI } from '@google/genai'
 import { getSql, isDatabaseConfigured } from './db.js'
+import { aggregateComplaintRecords } from './reporting.js'
 import {
+  createSupabaseAdminUser,
+  isSupabaseAuthConfigured,
+  signInWithPassword,
+  signOutSupabase,
+  signUpWithPassword,
+} from './supabaseAuth.js'
+import {
+  applySessionRefresh,
   clearSessionCookie,
   checkRateLimit,
   checkSameOrigin,
   getBody,
   json,
-  randomToken,
   requireRole,
   requireSession,
   sessionCookie,
-  sha256,
 } from './security.js'
 
 const registerSchema = z.object({
@@ -44,13 +52,18 @@ const analysisSchema = z.object({
   suggestedDepartment: z.string().min(1).max(120),
   priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']),
   urgency: z.enum(['LOW', 'NORMAL', 'URGENT', 'IMMEDIATE']),
-  sentiment: z.enum(['POSITIVE', 'NEGATIVE', 'FRUSTATED', 'ANGRY', 'FEARFUL', 'DISTRESSED', 'NEUTRAL']),
+  sentiment: z.enum(['POSITIVE', 'NEGATIVE', 'FRUSTRATED', 'ANGRY', 'FEARFUL', 'DISTRESSED', 'NEUTRAL']),
   issueType: z.string().min(1).max(180),
   keywords: z.array(z.string().min(1).max(50)).min(1).max(12),
   safetyFlags: z.array(z.string().min(1).max(80)).max(20),
   requiresHumanReview: z.boolean(),
   explanation: z.string().min(1).max(1000),
   recommendation: z.string().min(1).max(1000),
+})
+
+const reportSummarySchema = z.object({
+  summary: z.string().min(1).max(1200),
+  recommendations: z.array(z.string().min(1).max(400)).max(5),
 })
 
 const SAFETY_PATTERNS = [
@@ -74,15 +87,6 @@ const CATEGORY_DEPARTMENTS = {
   'Student Welfare & Safety': 'Student Welfare',
   'Placement & Career': 'Placement Cell',
   'Campus Environment': 'Infrastructure Department',
-}
-
-async function createSession(sql, userId) {
-  const token = randomToken()
-  await sql`
-    insert into sessions (user_id, token_hash, expires_at)
-    values (${userId}, ${sha256(token)}, now() + interval '7 days')
-  `
-  return token
 }
 
 function publicUser(row) {
@@ -109,7 +113,7 @@ Custom category: ${customCategory || ''}
 Complaint: ${text}
 Allowed priorities: LOW, MEDIUM, HIGH, CRITICAL
 Allowed urgency: LOW, NORMAL, URGENT, IMMEDIATE
-Allowed sentiment: POSITIVE, NEGATIVE, FRUSTATED, ANGRY, FEARFUL, DISTRESSED, NEUTRAL
+Allowed sentiment: POSITIVE, NEGATIVE, FRUSTRATED, ANGRY, FEARFUL, DISTRESSED, NEUTRAL
 Safety indicators require human review but are not diagnoses.`
 
   const response = await ai.models.generateContent({
@@ -138,13 +142,32 @@ async function callEmbedding(text) {
     config: { outputDimensionality: 768 },
   })
   const embedding = result.embeddings?.[0]?.values
-  if (!Array.isArray(embedding) || embedding.length < 100) {
+  if (!Array.isArray(embedding) || embedding.length !== 768 || !embedding.every(Number.isFinite)) {
     throw new Error('Gemini returned an invalid embedding.')
   }
   return { embedding, model }
 }
 
-export default async function handler(request) {
+async function callGeminiReportSummary(report) {
+  const apiKey = process.env.GEMINI_API_KEY
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not configured.')
+  const model = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite'
+  const ai = new GoogleGenAI({ apiKey })
+  const response = await ai.models.generateContent({
+    model,
+    contents: `Summarize these aggregate campus complaint statistics for management. Do not infer individual identities or claim causation. Return JSON with "summary" and "recommendations" (array of at most 5 strings).\n${JSON.stringify(report)}`,
+    config: { responseMimeType: 'application/json' },
+  })
+  let result
+  try {
+    result = JSON.parse(response.text)
+  } catch {
+    throw new Error('Gemini returned invalid JSON.')
+  }
+  return reportSummarySchema.parse(result)
+}
+
+async function handleRequest(request) {
   const originError = checkSameOrigin(request)
   if (originError) return json(403, { error: originError })
   const rateError = checkRateLimit(request, 'api', 120)
@@ -158,8 +181,20 @@ export default async function handler(request) {
   const url = new URL(request.url)
   const pathname = url.pathname.replace(/^\/api/, '').replace(/\/$/, '') || '/'
   const method = request.method
+  if (pathname.startsWith('/auth/') && !isSupabaseAuthConfigured()) {
+    await sql.end({ timeout: 5 }).catch(() => {})
+    return json(503, { error: 'Supabase Auth configuration required.', code: 'SUPABASE_AUTH_NOT_CONFIGURED' })
+  }
 
   try {
+    if (pathname === '/health' && method === 'GET') {
+      await sql`select 1 as database_ready`
+      return json(200, {
+        database: 'connected',
+        supabaseAuthConfigured: isSupabaseAuthConfigured(),
+      })
+    }
+
     if (pathname === '/admin/bootstrap' && method === 'POST') {
       const secret = request.headers.get('x-admin-bootstrap-secret')
       if (!process.env.ADMIN_BOOTSTRAP_SECRET || secret !== process.env.ADMIN_BOOTSTRAP_SECRET) {
@@ -180,18 +215,47 @@ export default async function handler(request) {
       if (parsed.data.role === 'departmentAdmin' && !parsed.data.department) {
         return json(400, { error: 'Department administrators require an assigned department.' })
       }
-      const existing = await sql`select id from users where lower(email) = lower(${parsed.data.email}) limit 1`
-      if (existing.length) return json(409, { error: 'An account with this email already exists.' })
+      const existingRows = await sql`
+        select id, role, auth_user_id, department_id
+        from users where lower(email) = lower(${parsed.data.email}) limit 1
+      `
+      const existing = existingRows[0]
+      if (existing?.auth_user_id) return json(409, { error: 'An account with this email already exists.' })
+      if (existing && (!requireRole(existing, ['superAdmin', 'managementViewer', 'departmentAdmin', 'safeguardingOfficer'])
+        || existing.role !== parsed.data.role)) {
+        return json(409, { error: 'The existing profile role cannot be changed through administrator bootstrap.' })
+      }
       let departmentId = null
       if (parsed.data.department) {
         const department = await sql`select id from departments where lower(name) = lower(${parsed.data.department}) limit 1`
-        departmentId = department[0]?.id || null
+        if (!department[0]) return json(400, { error: 'The selected department does not exist.' })
+        departmentId = department[0].id
       }
-      const passwordHash = await bcrypt.hash(parsed.data.password, 12)
-      await sql`
-        insert into users (name, email, password_hash, role, department_id)
-        values (${parsed.data.name}, ${parsed.data.email.toLowerCase()}, ${passwordHash}, ${parsed.data.role}, ${departmentId})
-      `
+      if (existing && existing.department_id !== departmentId) {
+        return json(409, { error: 'The existing administrator department cannot be changed during bootstrap.' })
+      }
+      const authUser = await createSupabaseAdminUser({
+        email: parsed.data.email.toLowerCase(),
+        password: parsed.data.password,
+        name: parsed.data.name,
+      })
+      if (existing) {
+        await sql`
+          update users
+          set auth_user_id = ${authUser.id}, name = ${parsed.data.name},
+              legacy_password_hash = null, updated_at = now()
+          where id = ${existing.id} and auth_user_id is null
+        `
+      } else {
+        await sql`
+          insert into users (id, auth_user_id, name, email, role, department_id)
+          values (${authUser.id}, ${authUser.id}, ${parsed.data.name}, ${parsed.data.email.toLowerCase()}, ${parsed.data.role}, ${departmentId})
+          on conflict (auth_user_id) do update
+            set name = excluded.name, email = excluded.email, role = excluded.role,
+                department_id = excluded.department_id, account_status = 'active',
+                updated_at = now()
+        `
+      }
       await sql`
         insert into audit_logs (action, entity_type, details)
         values ('bootstrap_administrator', 'user', ${JSON.stringify({ role: parsed.data.role })}::jsonb)
@@ -207,20 +271,37 @@ export default async function handler(request) {
       const body = parsed.data
       const existing = await sql`select id from users where lower(email) = lower(${body.email}) limit 1`
       if (existing.length) return json(409, { error: 'An account with this email already exists.' })
-
-      const passwordHash = await bcrypt.hash(body.password, 12)
+      const authResult = await signUpWithPassword({
+        email: body.email.toLowerCase(),
+        password: body.password,
+        name: body.name,
+        studentId: body.studentId,
+        department: body.department || 'General Administration',
+      })
+      if (!authResult.user?.id) {
+        return json(502, { error: 'Supabase did not return a user record.' })
+      }
       const department = await sql`select id, name from departments where lower(name) = lower(${body.department || 'General Administration'}) limit 1`
       const departmentId = department[0]?.id || null
       const rows = await sql`
-        insert into users (name, email, password_hash, role, student_id, department_id)
-        values (${body.name}, ${body.email.toLowerCase()}, ${passwordHash}, 'student', ${body.studentId}, ${departmentId})
+        update users
+        set name = ${body.name}, email = ${body.email.toLowerCase()},
+            student_id = ${body.studentId}, department_id = ${departmentId},
+            updated_at = now()
+        where auth_user_id = ${authResult.user.id} and role = 'student'
         returning id, name, email, role, student_id, department_id
       `
       const row = rows[0]
-      const token = await createSession(sql, row.id)
-      return json(201, { user: publicUser({ ...row, department: body.department || null }) }, {
-        'set-cookie': sessionCookie(token),
-      })
+      if (!row) return json(409, { error: 'An account with this email already exists.' })
+      if (!authResult.access_token || !authResult.refresh_token) {
+        return json(201, {
+          confirmationRequired: true,
+          message: 'Check your email to confirm your account, then sign in.',
+        })
+      }
+      return json(201, {
+        user: publicUser({ ...row, department: department[0]?.name || null }),
+      }, { 'set-cookie': sessionCookie(authResult) })
     }
 
     if (pathname === '/auth/login' && method === 'POST') {
@@ -229,23 +310,66 @@ export default async function handler(request) {
       const parsed = loginSchema.safeParse(await getBody(request))
       if (!parsed.success) return json(400, { error: 'Invalid login data.' })
       const body = parsed.data
+      let authResult
+      try {
+        authResult = await signInWithPassword({ email: body.email.toLowerCase(), password: body.password })
+      } catch (authError) {
+        if (authError.status !== 401) throw authError
+        const legacyRows = await sql`
+          select id, name, email, role, auth_user_id, legacy_password_hash
+          from users where lower(email) = lower(${body.email}) limit 1
+        `
+        const legacyUser = legacyRows[0]
+        if (!legacyUser?.legacy_password_hash || legacyUser.auth_user_id
+          || !(await bcrypt.compare(body.password, legacyUser.legacy_password_hash))) {
+          throw authError
+        }
+        const createdAuthUser = await createSupabaseAdminUser({
+          email: legacyUser.email,
+          password: body.password,
+          name: legacyUser.name,
+        })
+        const linkedRows = await sql`
+          update users
+          set auth_user_id = ${createdAuthUser.id},
+              legacy_password_hash = null,
+              updated_at = now()
+          where id = ${legacyUser.id}
+            and (auth_user_id is null or auth_user_id = ${createdAuthUser.id})
+          returning id
+        `
+        if (!linkedRows[0]) {
+          return json(500, { error: 'The legacy account could not be linked. Contact an administrator.' })
+        }
+        await sql`
+          insert into audit_logs (actor_id, action, entity_type, entity_id, details)
+          values (${legacyUser.id}, 'migrate_legacy_auth', 'user', ${legacyUser.id},
+            ${JSON.stringify({ role: legacyUser.role })}::jsonb)
+        `
+        authResult = await signInWithPassword({ email: body.email.toLowerCase(), password: body.password })
+      }
       const rows = await sql`
-        select u.id, u.name, u.email, u.password_hash, u.role, u.student_id, u.account_status,
+        select u.id, u.name, u.email, u.role, u.student_id, u.account_status,
                d.name as department
         from users u left join departments d on d.id = u.department_id
-        where lower(u.email) = lower(${body.email}) limit 1
+        where u.auth_user_id = ${authResult.user.id} limit 1
       `
       const row = rows[0]
-      if (!row || row.account_status !== 'active' || !(await bcrypt.compare(body.password, row.password_hash))) {
-        return json(401, { error: 'Invalid email or password.' })
-      }
-      const token = await createSession(sql, row.id)
-      return json(200, { user: publicUser(row) }, { 'set-cookie': sessionCookie(token) })
+      if (!row || row.account_status !== 'active') return json(403, { error: 'This account is not active.' })
+      return json(200, { user: publicUser(row) }, { 'set-cookie': sessionCookie(authResult) })
     }
 
     if (pathname === '/auth/logout' && method === 'POST') {
-      const token = (request.headers.get('cookie') || '').match(/campusvoice_session=([^;]+)/)?.[1]
-      if (token) await sql`update sessions set revoked_at = now() where token_hash = ${sha256(decodeURIComponent(token))}`
+      const encoded = (request.headers.get('cookie') || '')
+        .split(';').map((item) => item.trim()).find((item) => item.startsWith('campusvoice_session='))?.slice('campusvoice_session='.length)
+      if (encoded) {
+        try {
+          const session = JSON.parse(Buffer.from(decodeURIComponent(encoded), 'base64url').toString('utf8'))
+          await signOutSupabase(session.accessToken).catch(() => {})
+        } catch {
+          // A malformed local cookie is cleared regardless.
+        }
+      }
       return json(200, { ok: true }, { 'set-cookie': clearSessionCookie() })
     }
 
@@ -301,10 +425,19 @@ export default async function handler(request) {
         ai = await callGemini(body.originalComplaint, body.category, body.subcategory, body.customCategory)
         embedding = await callEmbedding(body.originalComplaint)
       } catch (error) {
-        await sql`
-          insert into ai_requests (request_type, model_name, status, error_code)
-          values ('complaint_analysis', ${process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite'}, 'failed', ${error?.message?.slice(0, 120) || 'unknown'})
-        `.catch(() => {})
+        try {
+          await sql`
+            insert into ai_requests (request_type, model_name, status, error_code)
+            values (
+              'complaint_analysis',
+              ${process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite'},
+              'failed',
+              ${String(error?.status || error?.name || 'unknown').slice(0, 120)}
+            )
+          `
+        } catch (logError) {
+          console.error('AI failure telemetry could not be recorded:', logError?.name || 'Error')
+        }
         return json(502, { error: 'Gemini analysis is unavailable. No complaint was stored.' })
       }
 
@@ -352,7 +485,7 @@ export default async function handler(request) {
         `
         await tx`
           insert into complaint_embeddings (complaint_id, embedding, model_name)
-          values (${complaintRow.id}, ${JSON.stringify(embedding.embedding)}::vector, ${embedding.model})
+          values (${complaintRow.id}, ${JSON.stringify(embedding.embedding)}::extensions.vector, ${embedding.model})
         `
         await tx`
           insert into status_history (complaint_id, to_status, actor_id, note)
@@ -374,23 +507,24 @@ export default async function handler(request) {
         `
         const nearby = await tx`
           select ig.id,
-                 1 - (ce.embedding <=> ${JSON.stringify(embedding.embedding)}::vector) as similarity
+                 1 - (ce.embedding OPERATOR(extensions.<=>) ${JSON.stringify(embedding.embedding)}::extensions.vector) as similarity
           from issue_groups ig
           join issue_group_members igm on igm.issue_group_id = ig.id
           join complaint_embeddings ce on ce.complaint_id = igm.complaint_id
           where ig.department_id = ${departmentId}
-          order by ce.embedding <=> ${JSON.stringify(embedding.embedding)}::vector
+            and ig.is_safety_restricted = ${isRestricted}
+          order by ce.embedding OPERATOR(extensions.<=>) ${JSON.stringify(embedding.embedding)}::extensions.vector
           limit 1
         `
         let issueGroupId = nearby[0]?.id
         if (!issueGroupId || Number(nearby[0].similarity) < 0.78) {
           const createdGroup = await tx`
             insert into issue_groups (
-              title, department_id, representative_complaint_id, summary,
+              title, department_id, is_safety_restricted, representative_complaint_id, summary,
               first_reported, latest_reported
             ) values (
               ${`${ai.analysis.category} - ${ai.analysis.subcategory}`},
-              ${departmentId}, ${complaintRow.id}, ${ai.analysis.summary},
+              ${departmentId}, ${isRestricted}, ${complaintRow.id}, ${ai.analysis.summary},
               now(), now()
             ) returning id
           `
@@ -549,39 +683,39 @@ export default async function handler(request) {
       let rows
       if (user.role === 'departmentAdmin') {
         rows = await sql`
-          select c.*, ca.priority, ca.sentiment
+          select c.*, coalesce(ca.category, c.category, c.selected_category) as category,
+            coalesce(ca.priority, c.priority, 'MEDIUM') as priority, d.name as department
           from complaints c left join complaint_analyses ca on ca.complaint_id = c.id
+          left join departments d on d.id = c.suggested_department_id
           where c.suggested_department_id = ${user.department_id} and c.is_safety_restricted = false
         `
       } else if (user.role === 'managementViewer') {
         rows = await sql`
-          select c.*, ca.priority, ca.sentiment
+          select c.*, coalesce(ca.category, c.category, c.selected_category) as category,
+            coalesce(ca.priority, c.priority, 'MEDIUM') as priority, d.name as department
           from complaints c left join complaint_analyses ca on ca.complaint_id = c.id
+          left join departments d on d.id = c.suggested_department_id
           where c.is_safety_restricted = false
         `
       } else if (user.role === 'safeguardingOfficer') {
         rows = await sql`
-          select c.*, ca.priority, ca.sentiment
+          select c.*, coalesce(ca.category, c.category, c.selected_category) as category,
+            coalesce(ca.priority, c.priority, 'MEDIUM') as priority, d.name as department
           from complaints c left join complaint_analyses ca on ca.complaint_id = c.id
+          left join departments d on d.id = c.suggested_department_id
           where c.is_safety_restricted = true
         `
       } else {
-        rows = await sql`select c.*, ca.priority, ca.sentiment from complaints c left join complaint_analyses ca on ca.complaint_id = c.id`
+        rows = await sql`
+          select c.*, coalesce(ca.category, c.category, c.selected_category) as category,
+            coalesce(ca.priority, c.priority, 'MEDIUM') as priority, d.name as department
+          from complaints c
+          left join complaint_analyses ca on ca.complaint_id = c.id
+          left join departments d on d.id = c.suggested_department_id
+        `
       }
-      const total = rows.length
-      const distinctStudents = new Set(rows.map((row) => row.student_id)).size
-      const resolved = rows.filter((row) => ['Resolved', 'Closed'].includes(row.status)).length
-      const critical = rows.filter((row) => row.priority === 'CRITICAL').length
       return json(200, {
-        analytics: {
-          total,
-          distinctStudents,
-          resolved,
-          unresolved: total - resolved,
-          critical,
-          resolutionRate: total ? (resolved / total) * 100 : 0,
-        },
-        complaints: rows,
+        analytics: aggregateComplaintRecords(rows),
       })
     }
 
@@ -603,13 +737,18 @@ export default async function handler(request) {
             count(distinct c.student_id)::int as complaint_count,
             count(distinct c.student_id)::int as distinct_students,
             count(igm.complaint_id)::int as member_count,
+            coalesce((array_agg(ca.priority order by case ca.priority when 'CRITICAL' then 4 when 'HIGH' then 3 when 'MEDIUM' then 2 when 'LOW' then 1 else 0 end desc))[1], 'MEDIUM') as priority,
+            coalesce((array_agg(ca.urgency order by case ca.urgency when 'IMMEDIATE' then 4 when 'URGENT' then 3 when 'NORMAL' then 2 when 'LOW' then 1 else 0 end desc))[1], 'NORMAL') as urgency,
+            jsonb_agg(jsonb_build_object('id', c.public_id, 'status', c.status, 'safetyFlags', coalesce(ca.safety_flags, '[]'::jsonb)) order by c.created_at desc) as complaints,
             min(c.created_at) as first_reported,
             max(c.created_at) as latest_reported
           from issue_groups ig
           join departments d on d.id = ig.department_id
           join issue_group_members igm on igm.issue_group_id = ig.id
           join complaints c on c.id = igm.complaint_id
-          where ig.department_id = ${user.department_id} and c.is_safety_restricted = false
+          left join complaint_analyses ca on ca.complaint_id = c.id
+          where ig.department_id = ${user.department_id}
+            and ig.is_safety_restricted = false and c.is_safety_restricted = false
           group by ig.id, d.name
           order by ig.latest_reported desc limit 500
         `
@@ -619,13 +758,17 @@ export default async function handler(request) {
             count(distinct c.student_id)::int as complaint_count,
             count(distinct c.student_id)::int as distinct_students,
             count(igm.complaint_id)::int as member_count,
+            coalesce((array_agg(ca.priority order by case ca.priority when 'CRITICAL' then 4 when 'HIGH' then 3 when 'MEDIUM' then 2 when 'LOW' then 1 else 0 end desc))[1], 'MEDIUM') as priority,
+            coalesce((array_agg(ca.urgency order by case ca.urgency when 'IMMEDIATE' then 4 when 'URGENT' then 3 when 'NORMAL' then 2 when 'LOW' then 1 else 0 end desc))[1], 'NORMAL') as urgency,
+            jsonb_agg(jsonb_build_object('id', c.public_id, 'status', c.status, 'safetyFlags', coalesce(ca.safety_flags, '[]'::jsonb)) order by c.created_at desc) as complaints,
             min(c.created_at) as first_reported,
             max(c.created_at) as latest_reported
           from issue_groups ig
           join departments d on d.id = ig.department_id
           join issue_group_members igm on igm.issue_group_id = ig.id
           join complaints c on c.id = igm.complaint_id
-          where c.is_safety_restricted = false
+          left join complaint_analyses ca on ca.complaint_id = c.id
+          where ig.is_safety_restricted = false and c.is_safety_restricted = false
           group by ig.id, d.name
           order by ig.latest_reported desc limit 500
         `
@@ -635,13 +778,17 @@ export default async function handler(request) {
             count(distinct c.student_id)::int as complaint_count,
             count(distinct c.student_id)::int as distinct_students,
             count(igm.complaint_id)::int as member_count,
+            coalesce((array_agg(ca.priority order by case ca.priority when 'CRITICAL' then 4 when 'HIGH' then 3 when 'MEDIUM' then 2 when 'LOW' then 1 else 0 end desc))[1], 'MEDIUM') as priority,
+            coalesce((array_agg(ca.urgency order by case ca.urgency when 'IMMEDIATE' then 4 when 'URGENT' then 3 when 'NORMAL' then 2 when 'LOW' then 1 else 0 end desc))[1], 'NORMAL') as urgency,
+            jsonb_agg(jsonb_build_object('id', c.public_id, 'status', c.status, 'safetyFlags', coalesce(ca.safety_flags, '[]'::jsonb)) order by c.created_at desc) as complaints,
             min(c.created_at) as first_reported,
             max(c.created_at) as latest_reported
           from issue_groups ig
           join departments d on d.id = ig.department_id
           join issue_group_members igm on igm.issue_group_id = ig.id
           join complaints c on c.id = igm.complaint_id
-          where c.is_safety_restricted = true
+          left join complaint_analyses ca on ca.complaint_id = c.id
+          where ig.is_safety_restricted = true and c.is_safety_restricted = true
           group by ig.id, d.name
           order by ig.latest_reported desc limit 500
         `
@@ -651,12 +798,16 @@ export default async function handler(request) {
             count(distinct c.student_id)::int as complaint_count,
             count(distinct c.student_id)::int as distinct_students,
             count(igm.complaint_id)::int as member_count,
+            coalesce((array_agg(ca.priority order by case ca.priority when 'CRITICAL' then 4 when 'HIGH' then 3 when 'MEDIUM' then 2 when 'LOW' then 1 else 0 end desc))[1], 'MEDIUM') as priority,
+            coalesce((array_agg(ca.urgency order by case ca.urgency when 'IMMEDIATE' then 4 when 'URGENT' then 3 when 'NORMAL' then 2 when 'LOW' then 1 else 0 end desc))[1], 'NORMAL') as urgency,
+            jsonb_agg(jsonb_build_object('id', c.public_id, 'status', c.status, 'safetyFlags', coalesce(ca.safety_flags, '[]'::jsonb)) order by c.created_at desc) as complaints,
             min(c.created_at) as first_reported,
             max(c.created_at) as latest_reported
           from issue_groups ig
           join departments d on d.id = ig.department_id
           join issue_group_members igm on igm.issue_group_id = ig.id
           join complaints c on c.id = igm.complaint_id
+          left join complaint_analyses ca on ca.complaint_id = c.id
           group by ig.id, d.name
           order by ig.latest_reported desc limit 500
         `
@@ -671,32 +822,44 @@ export default async function handler(request) {
       const body = await getBody(request)
       const reportSchema = z.object({
         periodType: z.enum(['week', 'month', 'quarter', 'custom']),
-        startAt: z.string().datetime().optional(),
-        endAt: z.string().datetime().optional(),
+        startAt: z.string().optional(),
+        endAt: z.string().optional(),
       })
       const parsed = reportSchema.safeParse(body)
       if (!parsed.success) return json(400, { error: 'Invalid report period.' })
       const now = new Date()
-      let startAt = new Date(now)
+      let startAt
       let endAt = new Date(now)
       if (parsed.data.periodType === 'week') {
-        startAt.setHours(0, 0, 0, 0)
-        startAt.setDate(startAt.getDate() - ((startAt.getDay() + 6) % 7))
+        startAt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+        startAt.setUTCDate(startAt.getUTCDate() - ((startAt.getUTCDay() + 6) % 7))
       } else if (parsed.data.periodType === 'month') {
-        startAt = new Date(now.getFullYear(), now.getMonth(), 1)
+        startAt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
       } else if (parsed.data.periodType === 'quarter') {
-        startAt = new Date(now.getFullYear(), now.getMonth() - 2, 1)
+        startAt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 2, 1))
       } else {
-        startAt = new Date(parsed.data.startAt || '')
-        endAt = new Date(parsed.data.endAt || '')
-        if (!Number.isFinite(startAt.getTime()) || !Number.isFinite(endAt.getTime()) || startAt > endAt) {
+        const startValue = parsed.data.startAt || ''
+        const endValue = parsed.data.endAt || ''
+        startAt = new Date(/^\d{4}-\d{2}-\d{2}$/.test(startValue) ? `${startValue}T00:00:00.000Z` : startValue)
+        endAt = new Date(/^\d{4}-\d{2}-\d{2}$/.test(endValue) ? `${endValue}T23:59:59.999Z` : endValue)
+        const hasInvalidCalendarDate = [startValue, endValue].some((value) => {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+          const date = new Date(`${value}T00:00:00.000Z`)
+          return !Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== value
+        })
+        if (!Number.isFinite(startAt.getTime()) || !Number.isFinite(endAt.getTime()) || startAt > endAt || hasInvalidCalendarDate) {
           return json(400, { error: 'Invalid custom report range.' })
         }
       }
-      const roleFilter = user.role === 'departmentAdmin'
+      const reportRows = user.role === 'departmentAdmin'
         ? await sql`
-            select c.*, ca.priority, ca.sentiment
-            from complaints c left join complaint_analyses ca on ca.complaint_id = c.id
+            select c.student_id, c.status, c.is_safety_restricted, c.created_at,
+              coalesce(ca.category, c.category, c.selected_category) as category,
+              coalesce(d.name, 'General Administration') as department,
+              coalesce(ca.priority, c.priority, 'MEDIUM') as priority
+            from complaints c
+            left join complaint_analyses ca on ca.complaint_id = c.id
+            left join departments d on d.id = c.suggested_department_id
             where c.suggested_department_id = ${user.department_id}
               and c.is_safety_restricted = false
               and c.created_at >= ${startAt.toISOString()}
@@ -704,38 +867,89 @@ export default async function handler(request) {
           `
         : user.role === 'managementViewer'
           ? await sql`
-              select c.*, ca.priority, ca.sentiment
-              from complaints c left join complaint_analyses ca on ca.complaint_id = c.id
+              select c.student_id, c.status, c.is_safety_restricted, c.created_at,
+                coalesce(ca.category, c.category, c.selected_category) as category,
+                coalesce(d.name, 'General Administration') as department,
+                coalesce(ca.priority, c.priority, 'MEDIUM') as priority
+              from complaints c
+              left join complaint_analyses ca on ca.complaint_id = c.id
+              left join departments d on d.id = c.suggested_department_id
               where c.is_safety_restricted = false
                 and c.created_at >= ${startAt.toISOString()}
                 and c.created_at <= ${endAt.toISOString()}
             `
           : user.role === 'safeguardingOfficer'
             ? await sql`
-                select c.*, ca.priority, ca.sentiment
-                from complaints c left join complaint_analyses ca on ca.complaint_id = c.id
+                select c.student_id, c.status, c.is_safety_restricted, c.created_at,
+                  coalesce(ca.category, c.category, c.selected_category) as category,
+                  coalesce(d.name, 'General Administration') as department,
+                  coalesce(ca.priority, c.priority, 'MEDIUM') as priority
+                from complaints c
+                left join complaint_analyses ca on ca.complaint_id = c.id
+                left join departments d on d.id = c.suggested_department_id
                 where c.is_safety_restricted = true
                   and c.created_at >= ${startAt.toISOString()}
                   and c.created_at <= ${endAt.toISOString()}
               `
             : await sql`
-                select c.*, ca.priority, ca.sentiment
-                from complaints c left join complaint_analyses ca on ca.complaint_id = c.id
+                select c.student_id, c.status, c.is_safety_restricted, c.created_at,
+                  coalesce(ca.category, c.category, c.selected_category) as category,
+                  coalesce(d.name, 'General Administration') as department,
+                  coalesce(ca.priority, c.priority, 'MEDIUM') as priority
+                from complaints c
+                left join complaint_analyses ca on ca.complaint_id = c.id
+                left join departments d on d.id = c.suggested_department_id
                 where c.created_at >= ${startAt.toISOString()}
                   and c.created_at <= ${endAt.toISOString()}
               `
+      const issueGroups = await sql`
+        select count(distinct ig.id)::int as count
+        from issue_groups ig
+        join issue_group_members igm on igm.issue_group_id = ig.id
+        join complaints c on c.id = igm.complaint_id
+        where c.created_at >= ${startAt.toISOString()}
+          and c.created_at <= ${endAt.toISOString()}
+          and (${user.role === 'superAdmin'} or ig.is_safety_restricted = ${user.role === 'safeguardingOfficer'})
+          and (${user.role !== 'departmentAdmin'} or ig.department_id = ${user.department_id})
+      `
       const report = {
         periodType: parsed.data.periodType,
         startAt: startAt.toISOString(),
         endAt: endAt.toISOString(),
-        total: roleFilter.length,
-        distinctStudents: new Set(roleFilter.map((row) => row.student_id)).size,
-        resolved: roleFilter.filter((row) => ['Resolved', 'Closed'].includes(row.status)).length,
-        critical: roleFilter.filter((row) => row.priority === 'CRITICAL').length,
+        ...aggregateComplaintRecords(reportRows, { groupCount: issueGroups[0]?.count || 0 }),
       }
+      let aiSummary = null
+      let aiSummaryStatus = 'unavailable'
+      try {
+        aiSummary = await callGeminiReportSummary(report)
+        aiSummaryStatus = 'generated'
+        await sql`
+          insert into ai_requests (request_type, model_name, status)
+          values ('management_summary', ${process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite'}, 'success')
+        `
+      } catch (summaryError) {
+        try {
+          await sql`
+            insert into ai_requests (request_type, model_name, status, error_code)
+            values (
+              'management_summary',
+              ${process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite'},
+              'failed',
+              ${String(summaryError?.status || summaryError?.name || 'unknown').slice(0, 120)}
+            )
+          `
+        } catch (logError) {
+          console.error('AI report telemetry could not be recorded:', logError?.name || 'Error')
+        }
+      }
+      report.aiSummary = aiSummary
+      report.aiSummaryStatus = aiSummaryStatus
       await sql`
-        insert into management_reports (generated_by, period_type, start_at, end_at, report)
-        values (${user.id}, ${parsed.data.periodType}, ${startAt.toISOString()}, ${endAt.toISOString()}, ${JSON.stringify(report)}::jsonb)
+        insert into management_reports (generated_by, period_type, start_at, end_at, report, executive_summary)
+        values (
+          ${user.id}, ${parsed.data.periodType}, ${startAt.toISOString()}, ${endAt.toISOString()},
+          ${JSON.stringify(report)}::jsonb, ${aiSummary?.summary || null}
+        )
       `
       return json(200, { report })
     }
@@ -749,4 +963,9 @@ export default async function handler(request) {
   } finally {
     await sql.end({ timeout: 5 }).catch(() => {})
   }
+}
+
+export default async function handler(request) {
+  const response = await handleRequest(request)
+  return applySessionRefresh(request, response)
 }
