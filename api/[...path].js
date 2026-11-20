@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer'
 import bcrypt from 'bcryptjs'
 import { z } from 'zod'
 import { GoogleGenAI } from '@google/genai'
-import { getSql, isDatabaseConfigured } from './db.js'
+import { classifyError, getSql, isDatabaseConfigured } from './db.js'
 import { aggregateComplaintRecords } from './reporting.js'
 import {
   createSupabaseAdminUser,
@@ -177,16 +177,17 @@ async function handleRequest(request) {
     return json(503, { error: 'Database configuration required.', code: 'DATABASE_NOT_CONFIGURED' })
   }
 
-  const sql = getSql()
+  let sql
   const url = new URL(request.url)
   const pathname = url.pathname.replace(/^\/api/, '').replace(/\/$/, '') || '/'
   const method = request.method
-  if (pathname.startsWith('/auth/') && !isSupabaseAuthConfigured()) {
-    await sql.end({ timeout: 5 }).catch(() => {})
-    return json(503, { error: 'Supabase Auth configuration required.', code: 'SUPABASE_AUTH_NOT_CONFIGURED' })
-  }
 
   try {
+    sql = getSql()
+    if (pathname.startsWith('/auth/') && !isSupabaseAuthConfigured()) {
+      return json(503, { error: 'Supabase Auth configuration required.', code: 'SUPABASE_AUTH_NOT_CONFIGURED' })
+    }
+
     if (pathname === '/health' && method === 'GET') {
       await sql`select 1 as database_ready`
       return json(200, {
@@ -958,10 +959,25 @@ async function handleRequest(request) {
   } catch (error) {
     if (error.status) return json(error.status, { error: error.message })
     if (error instanceof z.ZodError) return json(400, { error: 'Request validation failed.' })
+    const databaseError = classifyError(error)
+    if (databaseError.category.startsWith('db_') || databaseError.category === 'invalid_connection_url') {
+      const responses = {
+        db_auth_failure: ['Database authentication failed.', 'DATABASE_AUTH_FAILED'],
+        db_database_not_found: ['The configured database was not found.', 'DATABASE_NOT_FOUND'],
+        db_connection_failure: ['The database service is unavailable.', 'DATABASE_UNAVAILABLE'],
+        db_schema_error: ['The database schema is missing or incompatible.', 'DATABASE_SCHEMA_ERROR'],
+        db_ssl_failure: ['The secure database connection failed.', 'DATABASE_SSL_ERROR'],
+        db_query_failure: ['The database request could not be completed.', 'DATABASE_QUERY_ERROR'],
+        invalid_connection_url: ['The database connection configuration is invalid.', 'DATABASE_CONFIGURATION_INVALID'],
+      }
+      const [message, code] = responses[databaseError.category] || responses.db_connection_failure
+      console.error(`CampusVoice API database failure (${databaseError.category}; code=${databaseError.code || 'none'}).`)
+      return json(503, { error: message, code })
+    }
     console.error('CampusVoice API error:', error?.name || 'Error')
     return json(500, { error: 'The request could not be completed.' })
   } finally {
-    await sql.end({ timeout: 5 }).catch(() => {})
+    if (sql) await sql.end({ timeout: 5 }).catch(() => {})
   }
 }
 

@@ -365,6 +365,7 @@ ALTER TABLE public.management_actions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.feedback ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.ai_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.app_schema_migrations ENABLE ROW LEVEL SECURITY;
 DO $$
 BEGIN
   IF to_regclass('public.sessions') IS NOT NULL THEN
@@ -510,7 +511,8 @@ REVOKE ALL ON public.departments, public.users, public.complaints,
   public.complaint_analyses, public.complaint_embeddings, public.issue_groups,
   public.issue_group_members, public.status_history, public.notifications,
   public.safeguarding_cases, public.internal_notes, public.management_reports,
-  public.management_actions, public.feedback, public.audit_logs, public.ai_requests
+  public.management_actions, public.feedback, public.audit_logs, public.ai_requests,
+  public.app_schema_migrations
   FROM PUBLIC, anon, authenticated;
 GRANT SELECT ON public.departments TO anon, authenticated;
 REVOKE ALL ON public.users FROM PUBLIC, anon, authenticated;

@@ -51,6 +51,12 @@ describe('Supabase schema security declarations', () => {
     expect(schema).not.toContain('CREATE POLICY users_update_student_profile')
   })
 
+  it('keeps the migration ledger inaccessible to application roles', async () => {
+    const schema = await schemaPromise
+    expect(schema).toContain('ALTER TABLE public.app_schema_migrations ENABLE ROW LEVEL SECURITY;')
+    expect(schema).toMatch(/public\.app_schema_migrations\s+FROM PUBLIC, anon, authenticated;/)
+  })
+
   it('restricts student complaints and safeguarding records by profile and role', async () => {
     const schema = await schemaPromise
     expect(schema).toContain("(u.role = 'student' AND c.student_id = u.id)")
